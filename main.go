@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path"
@@ -15,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -119,6 +122,7 @@ Usage:
   ios ax [--font=<fontSize>] [options]
   ios resetax [options]
   ios debug [options] [--stop-at-entry] <app_path>
+  ios sidejit [options] [--port=<port>]
   ios fsync (rm [--r] | tree | mkdir) --path=<targetPath>
   ios fsync (pull | push) --srcPath=<srcPath> --dstPath=<dstPath>
   ios reboot [options]
@@ -241,6 +245,7 @@ The commands work as following:
    ios ax [--font=<fontSize>] [options]                               Access accessibility inspector features.
    ios resetax [options]                                              Reset accessibility settings to defaults.
    ios debug [--stop-at-entry] <app_path>                             Start debug with lldb
+   ios sidejit [--port=<port>]                                        Start SideJITServer-like service
    ios fsync (rm [--r] | tree | mkdir) --path=<targetPath>            Remove | treeview | mkdir in target path. --r used alongside rm will recursively remove all files and directories from target path.
    ios fsync (pull | push) --srcPath=<srcPath> --dstPath=<dstPath>    Pull or Push file from srcPath to dstPath.
    ios reboot [options]                                               Reboot the given device
@@ -353,6 +358,18 @@ The commands work as following:
 
 	userspaceTunnelPort, userspaceTunnelErr := arguments.Int("--userspace-port")
 
+	b, _ = arguments.Bool("sidejit")
+	if b {
+		port, err := arguments.Int("--port")
+		if err != nil {
+			port = 8080
+		}
+		err = serveSideJIT(tunnelInfoHost, tunnelInfoPort, userspaceTunnelHost, port)
+		if err != nil {
+			log.Error(err.Error())
+		}
+	}
+
 	device, err := ios.GetDevice(udid)
 	// device address and rsd port are only available after the tunnel started
 	if !tunnelCommand {
@@ -363,14 +380,16 @@ The commands work as following:
 				device.UserspaceTUNHost = userspaceTunnelHost
 				device.UserspaceTUNPort = userspaceTunnelPort
 			}
-			device = deviceWithRsdProvider(device, udid, address, rsdPort)
+			device, err = deviceWithRsdProvider(device, udid, address, rsdPort)
+			exitIfError("failed to connect to RSD", err)
 		} else {
 			info, err := tunnel.TunnelInfoForDevice(device.Properties.SerialNumber, tunnelInfoHost, tunnelInfoPort)
 			if err == nil {
 				device.UserspaceTUNPort = info.UserspaceTUNPort
 				device.UserspaceTUNHost = userspaceTunnelHost
 				device.UserspaceTUN = info.UserspaceTUN
-				device = deviceWithRsdProvider(device, udid, info.Address, info.RsdPort)
+				device, err = deviceWithRsdProvider(device, udid, info.Address, info.RsdPort)
+				exitIfError("failed to connect to RSD", err)
 			} else {
 				log.WithField("udid", device.Properties.SerialNumber).Warn("failed to get tunnel info")
 			}
@@ -2345,18 +2364,24 @@ func startTunnel(ctx context.Context, recordsPath string, tunnelInfoPort int, us
 	<-ctx.Done()
 }
 
-func deviceWithRsdProvider(device ios.DeviceEntry, udid string, address string, rsdPort int) ios.DeviceEntry {
+func deviceWithRsdProvider(device ios.DeviceEntry, udid string, address string, rsdPort int) (ios.DeviceEntry, error) {
 	rsdService, err := ios.NewWithAddrPortDevice(address, rsdPort, device)
-	exitIfError("could not connect to RSD", err)
+	if err != nil {
+		log.Error("could not connect to RSD")
+		return device, err
+	}
 	defer rsdService.Close()
 	rsdProvider, err := rsdService.Handshake()
 	device1, err := ios.GetDeviceWithAddress(udid, address, rsdProvider)
 	device1.UserspaceTUN = device.UserspaceTUN
 	device1.UserspaceTUNHost = device.UserspaceTUNHost
 	device1.UserspaceTUNPort = device.UserspaceTUNPort
-	exitIfError("error getting devicelist", err)
+	if err != nil {
+		log.Error("error getting devicelist")
+		return device, err
+	}
 
-	return device1
+	return device1, nil
 }
 
 func readPair(device ios.DeviceEntry) {
@@ -2369,6 +2394,333 @@ func readPair(device ios.DeviceEntry) {
 		exitIfError("failed converting to json", err)
 	}
 	fmt.Printf("%s\n", json)
+}
+
+// serveSideJIT starts a simple http serve that helps to enable JIT for an application.
+// The API has seven endpoints:
+// 1. GET localhost:{PORT}/                  to get all tunnels' uuid
+// 2. GET localhost:{PORT}/re                to refresh tunnels
+// 3. GET localhost:{PORT}/ver               to get version of the server
+// 4. GET localhost:{PORT}/{UDID}            to get app list that supports JIT
+// 5. GET localhost:{PORT}/{UDID}/all_apps   to refresh and get app list
+// 6. GET localhost:{PORT}/{UDID}/re         to refresh app list
+// 7. GET localhost:{PORT}/{UDID}/{APP_NAME} to enable JIT for an app
+
+func serveSideJIT(tunnelInfoHost string, tunnelInfoPort int, userspaceTunnelHost string, port int) error {
+	type AppInfo struct {
+		Name   string `json:"name"`
+		Bundle string `json:"bundle"`
+		PID    uint64 `json:"pid"`
+		CanJIT bool   `json:"-"`
+	}
+	appListOfDevices := make(map[string]*[]AppInfo)
+	appListLockOfDevices := make(map[string]*sync.Mutex)
+	var operateAppListLockLock sync.Mutex
+
+	tunnels, err := tunnel.ListRunningTunnels(tunnelInfoHost, tunnelInfoPort)
+	if err != nil {
+		log.Error(err)
+	}
+
+	getUdidMutex := func(udid string, create bool) *sync.Mutex {
+		operateAppListLockLock.Lock()
+		defer operateAppListLockLock.Unlock()
+		mutex, exist := appListLockOfDevices[udid]
+		if !exist {
+			if create {
+				mutex = &sync.Mutex{}
+				appListLockOfDevices[udid] = mutex
+				return mutex
+			} else {
+				return nil
+			}
+		}
+		return mutex
+	}
+	
+	getUdidAppList := func(udid string) *[]AppInfo {
+		operateAppListLockLock.Lock()
+		defer operateAppListLockLock.Unlock()
+		mutex, exist := appListLockOfDevices[udid]
+		if !exist {
+			return nil
+		}
+		mutex.Lock()
+		defer mutex.Unlock()
+		appList, exist := appListOfDevices[udid]
+		if !exist {
+			return nil
+		}
+		return appList
+	}
+
+	sendError := func(err error, writer http.ResponseWriter) {
+		writer.WriteHeader(http.StatusInternalServerError)
+		enc := json.NewEncoder(writer)
+		err1 := enc.Encode(map[string]interface{}{
+			"ERROR": err.Error(),
+		})
+		if err1 != nil {
+			log.Error(err1)
+			writer.Write([]byte(`{"ERROR": "JSON Encoder failed"}`))
+		}
+	}
+
+	refreshAppList := func(udid string) error {
+		device, err := ios.GetDevice(udid)
+		devExist := true
+		if err != nil {
+			devExist = false
+			/*
+			if writer != nil {
+				writer.WriteHeader(http.StatusNotFound)
+				writer.Write([]byte(`{"ERROR": "Invalid path or could not find device!"}`))
+			} else {
+				log.Error("device with " + udid + " does not exist")
+			}
+			*/
+
+		}
+
+		mutex := getUdidMutex(udid, devExist)
+		if mutex == nil {
+			return errors.New("Cannot find device with udid=" + udid)
+		}
+		mutex.Lock()
+		if !devExist {
+			operateAppListLockLock.Lock()
+			delete(appListOfDevices, udid)
+			delete(appListLockOfDevices, udid)
+			mutex.Unlock()
+			operateAppListLockLock.Unlock()
+			return errors.New("Device with udid=" + udid + " removed")
+		}
+		
+		conn, err := installationproxy.New(device)
+		if err != nil {
+			return err
+		}
+		appinfo, err := conn.BrowseUserApps()
+		if err != nil {
+			return err
+		}
+
+		appInfos := make([]AppInfo, len(appinfo))
+		for i, ai := range appinfo {
+			canJIT := true
+			getTaskAllow, ok := ai.Entitlements["get-task-allow"]
+			if !ok {
+				canJIT = false
+			} else if canJIT, ok = getTaskAllow.(bool); !ok {
+				canJIT = false
+			}
+			appInfos[i] = AppInfo{
+				Name:   ai.CFBundleDisplayName,
+				Bundle: ai.CFBundleIdentifier,
+				PID:    0,
+				CanJIT: canJIT,
+			}
+		}
+		appListOfDevices[udid] = &appInfos
+		mutex.Unlock()
+		return nil
+	}
+	
+	refreshTunnels := func() error {
+		tunnels, err = tunnel.ListRunningTunnels(tunnelInfoHost, tunnelInfoPort)
+		if err != nil {
+			return err
+		} else {
+			for _, tunnel := range tunnels {
+				refreshAppList(tunnel.Udid)
+			}
+			return nil
+		}
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /", func(writer http.ResponseWriter, request *http.Request) {
+		operation := strings.TrimPrefix(request.URL.Path, "/")
+		if operation == "" {
+			writer.Header().Add("Content-Type", "application/json")
+			tunnelInfo := make(map[string]string)
+			for _, tunnel := range tunnels {
+				tunnelInfo[tunnel.Udid] = tunnel.Udid
+			}
+			enc := json.NewEncoder(writer)
+			err = enc.Encode(tunnelInfo)
+			if err != nil {
+				sendError(err, writer)
+			}
+			return
+		}
+		operations := strings.Split(operation, "/")
+		if len(operations) == 2 {
+			if operations[1] == "re" {
+				writer.Header().Add("Content-Type", "application/json")
+				err = refreshAppList(operations[0])
+				if err != nil {
+					sendError(err, writer)
+				} else {
+					writer.Write([]byte(`{"OK": "Refreshed app list!"}`))
+				}
+			} else if operations[1] == "all_apps" {
+				writer.Header().Add("Content-Type", "application/json")
+				err = refreshAppList(operations[0])
+				if err != nil {
+					sendError(err, writer)
+					return
+				}
+				appList := getUdidAppList(operations[0])
+				if appList == nil {
+					writer.WriteHeader(http.StatusNotFound)
+					writer.Write([]byte(`{"ERROR": "Invalid path or could not find device!"}`))
+					return
+				}
+				enc := json.NewEncoder(writer)
+				err = enc.Encode(appList)
+				if err != nil {
+					sendError(err, writer)
+				}
+
+			} else {
+				appList := getUdidAppList(operations[0])
+				if appList == nil {
+					writer.Header().Add("Content-Type", "application/json")
+					writer.WriteHeader(http.StatusNotFound)
+					writer.Write([]byte(`{"ERROR": "Invalid path or could not find device!"}`))
+					return
+				}
+				var appInfo AppInfo
+				found := false
+				for _, appInfo1 := range *appList {
+					if appInfo1.Name == operations[1] {
+						if !appInfo1.CanJIT {
+							writer.Write([]byte("Cannot enable JIT for " + operations[1]))
+							return
+						}
+						appInfo = appInfo1
+						found = true
+					}
+				}
+				if !found {
+					writer.Write([]byte("Could not find " + operations[1] + "!"))
+					return
+				}
+
+				device, err := ios.GetDevice(operations[0])
+				if err != nil {
+					writer.Write([]byte("Failed to find the device: " + err.Error()))
+					return
+				}
+				var tunnelInfo tunnel.Tunnel
+				found = false
+				for _, tunnel := range tunnels {
+					if tunnel.Udid == operations[0] {
+						tunnelInfo = tunnel
+						found = true
+					}
+				}
+				if !found {
+					writer.Write([]byte("Failed to find the device"))
+					return
+				}
+
+				device.UserspaceTUNPort = tunnelInfo.UserspaceTUNPort
+				device.UserspaceTUNHost = userspaceTunnelHost
+				device.UserspaceTUN = tunnelInfo.UserspaceTUN
+				device, err = deviceWithRsdProvider(device, operations[0], tunnelInfo.Address, tunnelInfo.RsdPort)
+				// Refresh tunnels and try again
+				if err != nil && refreshTunnels() == nil {
+					device, err = deviceWithRsdProvider(device, operations[0], tunnelInfo.Address, tunnelInfo.RsdPort)
+				}
+				if err != nil {
+					writer.Write([]byte("Failed to connect to RSD: " + err.Error()))
+					return
+				}
+				processControl, err := instruments.NewProcessControl(device)
+				if err != nil {
+					writer.Write([]byte("Failed to start the app: " + err.Error()))
+					return
+				}
+				opts := map[string]interface{}{
+					"StartSuspendedKey": 1,
+					"KillExisting":      0,
+				}
+				pid, err := processControl.LaunchAppWithArgs(appInfo.Bundle, nil, nil, opts)
+				if err != nil {
+					writer.Write([]byte("Failed to start the app: " + err.Error()))
+					return
+				}
+				if appInfo.PID == pid {
+					writer.Write([]byte("JIT already enabled for " + operations[1] + "!"))
+					return
+				}
+				err = debugserver.AttachAndDetach(device, pid)
+				if err != nil {
+					writer.Write([]byte("Failed to enable JIT: " + err.Error()))
+				}
+				writer.Write([]byte("Enabled JIT for " + operations[1] + "!"))
+				for i, appInfo1 := range *appList {
+					if appInfo1.Name == operations[1] {
+						appInfo1.PID = pid
+						(*appList)[i] = appInfo1
+					}
+				}
+			}
+		} else if len(operations) == 1 {
+			writer.Header().Add("Content-Type", "application/json")
+			appList := getUdidAppList(operations[0])
+			if appList == nil {
+				writer.WriteHeader(http.StatusNotFound)
+				writer.Write([]byte(`{"ERROR": "Invalid path or could not find device!"}`))
+				return
+			}
+			jitableAppList := make([]AppInfo, 0)
+			for _, appInfo := range *appList {
+				if appInfo.CanJIT {
+					jitableAppList = append(jitableAppList, appInfo)
+				}
+			}
+			enc := json.NewEncoder(writer)
+			err = enc.Encode(jitableAppList)
+			if err != nil {
+				sendError(err, writer)
+			}
+		} else {
+			writer.Header().Add("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusNotFound)
+			writer.Write([]byte(`{"ERROR": "Invalid path or could not find device!"}`))
+		}
+	})
+	mux.HandleFunc("GET /re", func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Add("Content-Type", "application/json")
+		err := refreshTunnels()
+		if err != nil {
+			sendError(err, writer)
+		} else {
+			writer.Write([]byte(`{"OK": "Refreshed!"}`))
+		}
+	})
+	mux.HandleFunc("GET /ver", func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Add("Content-Type", "application/json")
+		enc := json.NewEncoder(writer)
+		err = enc.Encode(map[string]interface{}{
+			"go-ios": version,
+		})
+		if err != nil {
+			sendError(err, writer)
+		}
+	})
+	for _, tunnel := range tunnels {
+		refreshAppList(tunnel.Udid)
+	}
+	log.Info("SideJIT server started")
+	if err := http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", port), mux); err != nil {
+		return fmt.Errorf("serveSideJIT: failed to start http server: %w", err)
+	}
+	return nil
 }
 
 func marshalJSON(data interface{}) ([]byte, error) {

@@ -3,6 +3,7 @@ package debugserver
 import (
 	"errors"
 	"io"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -21,11 +22,12 @@ import (
 const (
 	serviceName    = "com.apple.debugserver"
 	sslServiceName = "com.apple.debugserver.DVTSecureSocketProxy"
+	rsdServiceName = "com.apple.internal.dt.remote.debugproxy"
 )
 
-// ref: https://github.com/steeve/itool/blob/master/debugserver/debugserver.go#L14
+// original: https://github.com/steeve/itool/blob/master/debugserver/debugserver.go#L14
 type DebugClient struct {
-	c         *ios.LockDownConnection
+	c         io.ReadWriter
 	gdbServer *GDBServer
 }
 
@@ -41,12 +43,8 @@ func (c *DebugClient) Request(req string) (string, error) {
 	return c.gdbServer.Request(req)
 }
 
-func (c *DebugClient) Close() {
-	c.c.Close()
-}
-
-func (c *DebugClient) Conn() net.Conn {
-	return c.c.Conn()
+func (c *DebugClient) Conn() io.ReadWriter {
+	return c.c
 }
 
 // Write the script file to the tmp directory and start lldb
@@ -151,6 +149,9 @@ func connectToDevice(device ios.DeviceEntry) (ios.DeviceConnectionInterface, err
 		log.Error("cannot find version, default use ssl debug server")
 		return ios.ConnectToService(device, sslServiceName)
 	}
+	if version.(string) >= "17" {
+		return nil, nil
+	}
 	if version.(string) > "14" {
 		return ios.ConnectToService(device, sslServiceName)
 	}
@@ -176,7 +177,8 @@ func Start(device ios.DeviceEntry, appPath string, stopAtEntry bool) error {
 	}
 	var container string
 	for _, ai := range appinfo {
-		if ai.CFBundleIdentifier == bundleId {
+		if (ai.CFBundleIdentifier == bundleId ||
+			strings.HasPrefix(ai.CFBundleIdentifier, bundleId + ".")) {
 			container = ai.Path
 			break
 		}
@@ -214,14 +216,70 @@ func Start(device ios.DeviceEntry, appPath string, stopAtEntry bool) error {
 			continue
 		}
 		go func() {
-			lc := ios.NewLockDownConnection(intf)
+			var remoteConn io.ReadWriter
+			if intf != nil {
+				remoteConn = ios.NewLockDownConnection(intf).Conn()
+			} else {
+				lc, err := ios.ConnectToServiceTunnelIface(device, rsdServiceName)
+				if err != nil {
+					log.Error(err)
+					return
+				}
+				defer lc.Close()
+				remoteConn = lc
+			}
 			cli := &DebugClient{
-				c:         lc,
-				gdbServer: NewGDBServer(lc.Conn()),
+				c:         remoteConn,
+				gdbServer: NewGDBServer(remoteConn),
 			}
 			// start proxy
 			go io.Copy(localConn, cli.Conn())
 			io.Copy(cli.Conn(), localConn)
 		}()
 	}
+}
+
+func AttachAndDetach(device ios.DeviceEntry, pid uint64) error {
+	intf, err := connectToDevice(device)
+	if err != nil {
+		return err
+	}
+	var conn io.ReadWriter
+	if intf != nil {
+		conn = ios.NewLockDownConnection(intf).Conn()
+	} else {
+		lc, err := ios.ConnectToServiceTunnelIface(device, rsdServiceName)
+		if err != nil {
+			return err
+		}
+		defer lc.Close()
+		conn = lc
+	}
+
+	gdbServer := NewGDBServer(conn)
+
+	reply, err := gdbServer.Request("QSetDetachOnError:1")
+	log.Debug("SetDetachOnError: ", reply)
+	if err != nil {
+		return err
+	} else if !strings.HasPrefix(reply, "OK") {
+		return errors.New("failed to SetDetachOnError")
+	}
+
+	reply, err = gdbServer.Request(fmt.Sprintf("vAttach;%x", pid))
+	log.Debug("Attach: ", reply)
+	if err != nil {
+		return err
+	} else if !strings.HasPrefix(reply, "T11thread") {
+		return errors.New("failed to attach the process")
+	}
+
+	reply, err = gdbServer.Request("D")
+	log.Debug("Detach: ", reply)
+	if err != nil {
+		return err
+	} else if !strings.HasPrefix(reply, "OK") {
+		return errors.New("failed to detach the process")
+	}
+	return nil
 }
