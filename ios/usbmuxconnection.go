@@ -42,7 +42,7 @@ func GetUsbmuxdSocket() string {
 	case "windows":
 		return "tcp://127.0.0.1:27015"
 	default:
-		return "unix:///var/run/usbmuxd"
+		return "unix:///data/data/com.termux/files/usr/var/run/usbmuxd"
 	}
 }
 

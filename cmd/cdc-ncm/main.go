@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"runtime"
+	//"runtime"
 )
 
 func checkRoot() {
@@ -18,10 +18,6 @@ func checkRoot() {
 }
 
 func checkLinux() {
-	if runtime.GOOS != "linux" {
-		slog.Error("go-ncm only works on linux")
-		os.Exit(1)
-	}
 }
 
 // accepts one cmd line argument: --prometheusport=8080
